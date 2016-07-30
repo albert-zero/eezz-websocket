@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.If not, see <http://www.gnu.org/licenses/>.
 // ------------------------------------------------------------
+// #define AP_HAVE_DESIGNATED_INITIALIZER
 
 // #include <iostream>
 #include <stdio.h>
@@ -26,6 +27,8 @@
 #include <exception>
 #include <hash_map>
 #include <sstream>
+#include <stdio.h>
+#include <string.h>
 
 #include "apr_hash.h"
 #include "ap_config.h"
@@ -46,8 +49,17 @@ static   mutex  aPythonMtx;
 typedef  hash_map<string, PyObject*> TPyHash;
 
 // ------------------------------------------------------------
-// TGuard takes a mutex, which is already locked and 
-// unlocks it at the end of the scope
+// ------------------------------------------------------------
+typedef struct {
+    vector<string> mPathList;
+    int            mWebsocket;
+    string         mHostname;
+} TEezzConfig;
+
+// ------------------------------------------------------------
+// Takes a mutex and tries to lock it. I would also accept a
+// mutex which is already locked. 
+// Unlocks the given mutex at the end of the scope.
 // ------------------------------------------------------------
 class TGuard {
 private:
@@ -55,6 +67,7 @@ private:
 public:
     TGuard(mutex *aMutex) {
         mMutex = aMutex;
+        mMutex->try_lock();
     }
     ~TGuard() {
         mMutex->unlock();
@@ -76,6 +89,57 @@ public:
         }
     }
 };
+
+static TEezzConfig mConfig;
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+const char *setPythonPath(cmd_parms *cmd, void *cfg, const char *arg) {
+    istringstream aPath(arg);
+    string        aSegment;
+
+    while (std::getline(aPath, aSegment, ':')) {
+        mConfig.mPathList.push_back(aSegment);
+    }
+    return NULL;
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+const char *setWebsocket(cmd_parms *cmd, void *cfg, const char *arg) {
+    mConfig.mWebsocket = atoi(arg);
+    return NULL;
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+const char *setHostname(cmd_parms *cmd, void *cfg, const char *arg) {
+    mConfig.mHostname = arg;
+    return NULL;
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+static const command_rec directives[] = {
+    AP_INIT_TAKE1("PythonPath", reinterpret_cast<cmd_func>(setPythonPath), NULL, ACCESS_CONF, "set the python path"),
+    AP_INIT_TAKE1("Websocket",  reinterpret_cast<cmd_func>(setWebsocket),  NULL, ACCESS_CONF, "set websocket port"),
+    AP_INIT_TAKE1("WsHostname", reinterpret_cast<cmd_func>(setHostname),   NULL, ACCESS_CONF, "set websocket host"),
+    { NULL }
+};
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+extern "C" static void register_hooks(apr_pool_t *pool);
+extern "C" module AP_MODULE_DECLARE_DATA eezz_websocket_module = {
+    STANDARD20_MODULE_STUFF,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    directives,
+    register_hooks
+};
+
 
 // ------------------------------------------------------------
 // Define an exception to interrupt Python processing
@@ -126,7 +190,7 @@ void startWebSocket() {
                 throw TPyExcept("");
             }
 
-            aPyHashMap["Address"]    = Py_BuildValue("(si)", "localhost", 8100);
+            aPyHashMap["Address"]    = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
             aPyHashMap["Arguments"]  = Py_BuildValue("(S)", aPyHashMap["Address"]);
             aPyHashMap["WebSocket"]  = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["Arguments"]);
 
@@ -138,7 +202,7 @@ void startWebSocket() {
             // aPyHashMap["ResultJoin"]  = PyObject_CallMethod(aPyHashMap["WebSocket"], "join", NULL);
         }
         catch (TPyExcept& xEx) {
-            //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "Failed to load websocket");
+            // ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "Failed to load websocket");
             PyErr_Print();
         }
     }
@@ -147,17 +211,22 @@ void startWebSocket() {
 // ------------------------------------------------------------
 // Next steps:
 // configure sys path to the distribution
-// 
+// configure python path
 // ------------------------------------------------------------
 extern "C" static int eezz_handler(request_rec *r) {
     // Initialize Python runtime
     TPyHash aPyHashMap;
     int     aReturn = OK;
     ostringstream aDocRoot;
+    ostringstream aAppRoot;
+
+    if (!r->handler || strcmp(r->handler, "eezz_websocket")) 
+        return (DECLINED);
     
-    if (!r->handler || strcmp(r->handler, "eezz_websocket")) return (DECLINED);
+    // TEezzConfig *aConfig = (TEezzConfig *)ap_get_module_config(r-> r->per_dir_config, &eezz_websocket_module);
 
     aDocRoot << r->htaccess->dir << "/public" << ends;
+    aAppRoot << r->htaccess->dir << "/applications/EezzServer" << ends;
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "eezz_handler");
     
@@ -168,27 +237,31 @@ extern "C" static int eezz_handler(request_rec *r) {
         string aFilePath(r->canonical_filename);
         size_t aPos  = aFilePath.find("webroot");
         ostringstream aPath;
-        // ['', 'C:\\WINDOWS\\SYSTEM32\\python34.zip', 'C:\\Python34\\DLLs', 'C:\\Python34\\lib', 'C:\\Python34', 'C:\\Python34\\lib\\site-packages']
-        // aPath << aFilePath.substr(0, aPos) << "webroot/applications/EezzServer" << ends;
-        // _putenv_s("PYTHONPATH", aPath.str().c_str());
-        // _putenv_s("PYTHONPATH", "\\Users\\Paul\\testpdc");
         Py_SetProgramName(L"eezz_websocket_handler");
         Py_Initialize();
-
+        
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "initialize %s", aPath.str().c_str());
         aPyHashMap["sys.Import"]   = Py_BuildValue("s", "sys");
         aPyHashMap["sys.Module"]   = PyImport_Import(aPyHashMap["sys.Import"]);
         aPyHashMap["sys.path"]     = PyObject_GetAttrString(aPyHashMap["sys.Module"], "path");
-        aPyHashMap["sys.path.ref"] = PyObject_CallMethod(aPyHashMap["sys.path"], "extend", "[sssss]", 
-            "C:\\Python34\\DLLs", 
-            "C:\\Python34\\lib", 
-            "C:\\Python34", 
-            "C:\\Python34\\lib\\site-packages",
-            "C:\\Users\\Paul\\production\\webroot\\applications\\EezzServer");
-    }
+        
+        for (string aSegment : mConfig.mPathList) {
+            PyObject_CallMethod( aPyHashMap["sys.path"], "append", "s", aSegment.c_str() );
+        }
 
-    // Start web socket and keep the thread alive
-    startWebSocket();
+        //aPyHashMap["sys.path.ref"] = PyObject_CallMethod(aPyHashMap["sys.path"], "extend", "[sssss]", 
+        //    "C:\\Python34\\DLLs", 
+        //    "C:\\Python34\\lib", 
+        //    "C:\\Python34", 
+        //    "C:\\Python34\\lib\\site-packages",
+        //    "C:\\Users\\Paul\\gitdev\\eezzgit\\webroot\\applications\\EezzServer");
+
+        // Start web socket
+        if (mConfig.mHostname.length() < 1) {
+            mConfig.mHostname = r->hostname;
+        }
+        startWebSocket();
+    }
     
     // Start the agent
     try {
@@ -240,22 +313,10 @@ extern "C" static void register_hooks(apr_pool_t *pool) {
     ap_hook_handler(eezz_handler, NULL, NULL, APR_HOOK_LAST);
 }
 
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-extern "C" module AP_MODULE_DECLARE_DATA eezz_websocket_module = {
-    STANDARD20_MODULE_STUFF,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    register_hooks   /* Our hook registering function */
-};
 
 // ------------------------------------------------------------
 // ------------------------------------------------------------
-int main(int argc, char* argv[])
-{
+int main(int argc, char* argv[]) {
 	return 0;
 }
 
