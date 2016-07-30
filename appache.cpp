@@ -50,7 +50,7 @@ static   condition_variable mCv;
 static   condition_variable mReady;
 static   mutex  aPythonMtx;
 static   mutex  aReadyMtx;
-static   bool   aPythonReady = false;
+static   bool   aPythonBusy = true;
 thread  *mThread;
 typedef  hash_map<string, PyObject*> TPyHash;
 
@@ -235,7 +235,7 @@ void runPython() {
         // Send the result
         Py_ssize_t aSize;
         string     aAsciiResult;
-        wchar_t *aStringRes = PyUnicode_AsWideCharString(aPyLocalMap["ResultHdle"], &aSize);
+        wchar_t   *aStringRes = PyUnicode_AsWideCharString(aPyLocalMap["ResultHdle"], &aSize);
         if (aStringRes == NULL) {
             PyErr_Print();
             break;
@@ -252,7 +252,7 @@ void runPython() {
         aPyLocalMap["ResultShut"] = PyObject_CallMethod(aPyLocalMap["Agent"], "shutdown", NULL);
 
         std::unique_lock<std::mutex> lck(aReadyMtx);
-        aPythonReady = true;
+        aPythonBusy = false;
         mReady.notify_all();
         mReady.wait(lck);
     }
@@ -273,9 +273,8 @@ extern "C" static int eezz_handler(request_rec *r) {
     }
 
     mConfig.mRequest = r;
-    aPythonReady     = false;
+    aPythonBusy      = true;
     mReady.notify_all();
-
 
     if (aPythonMtx.try_lock()) {
         string aFile = r->filename;
@@ -284,9 +283,10 @@ extern "C" static int eezz_handler(request_rec *r) {
         mThread = new thread(runPython);        
     }
 
-    std::unique_lock<std::mutex> lck(aReadyMtx);
-    while (!aPythonReady) mReady.wait(lck);
-
+    if (aPythonBusy) {
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        mReady.wait(lck);
+    }
     return aReturn;
 }
 
