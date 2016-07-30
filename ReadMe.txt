@@ -18,7 +18,7 @@ DocumentRoot /apache/httpdoc/webroot/public
 
 <Files ~ "\.(eezz)$"> 
 	PythonPath "/Python34:/Python34/DLLs:/Python34/DLLs:/Python34/lib:/Python34/site-packages:/apache/httpdoc/webroot/applications/EezzServer"
-	Websocket  8100
+	Websocket  8401
 	WsHostname localhost
 	SetHandler eezz_websocket
 </Files>

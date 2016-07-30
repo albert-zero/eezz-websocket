@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string>
 #include <thread>
+#include <condition_variable>
 #include <mutex>
 #include <locale>
 #include <codecvt>
@@ -45,7 +46,12 @@
 
 using namespace std;
 static   mutex  aMutex;
+static   condition_variable mCv;
+static   condition_variable mReady;
 static   mutex  aPythonMtx;
+static   mutex  aReadyMtx;
+static   bool   aPythonReady = false;
+thread  *mThread;
 typedef  hash_map<string, PyObject*> TPyHash;
 
 // ------------------------------------------------------------
@@ -54,6 +60,8 @@ typedef struct {
     vector<string> mPathList;
     int            mWebsocket;
     string         mHostname;
+    string         mDocumentRoot;
+    request_rec   *mRequest;
 } TEezzConfig;
 
 // ------------------------------------------------------------
@@ -165,48 +173,91 @@ public:
 // port
 // webroot for python application
 // ------------------------------------------------------------
-void startWebSocket() {
+void runPython() {
     TPyHash aPyHashMap;
+    
+    // Initialize thread
+    Py_SetProgramName(L"eezz_websocket_handler");
+    Py_Initialize();
 
-    if (aMutex.try_lock()) {
-        // Release the mutex at the end of the block
-        TGuard aMtxGuard(&aMutex);
+    aPyHashMap["sys.Import"] = Py_BuildValue("s", "sys");
+    aPyHashMap["sys.Module"] = PyImport_Import(aPyHashMap["sys.Import"]);
+    aPyHashMap["sys.path"]   = PyObject_GetAttrString(aPyHashMap["sys.Module"], "path");
 
-        try {
-            // Handle the reference count of PyObjects
-            TGuardObjects aObjGuard(&aPyHashMap);
-            
-            // Start the web socket interface
-            aPyHashMap["Import"]     = Py_BuildValue("s", "eezz.websocket");
-            aPyHashMap["Module"]     = PyImport_Import(aPyHashMap["Import"]);
+    for (string aSegment : mConfig.mPathList) {
+        PyObject_CallMethod(aPyHashMap["sys.path"], "append", "s", aSegment.c_str());
+    }
 
-            if (aPyHashMap["Module"] == NULL) {
-                throw TPyExcept("");
-            }
-            //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "load eezz.websocket");
-            aPyHashMap["TWebSocket"] = PyObject_GetAttrString(aPyHashMap["Module"], "TWebSocket");
+    // start websocket
+    aPyHashMap["websocket.Import"] = Py_BuildValue("s", "eezz.websocket");
+    aPyHashMap["websocket.Module"] = PyImport_Import(aPyHashMap["websocket.Import"]);
 
-            if (aPyHashMap["TWebSocket"] == NULL) {
-                throw TPyExcept("");
-            }
+    if (aPyHashMap["websocket.Module"] == NULL) {
+        throw TPyExcept("");
+    }
+    //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "load eezz.websocket");
+    aPyHashMap["TWebSocket"] = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWebSocket");
 
-            aPyHashMap["Address"]    = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
-            aPyHashMap["Arguments"]  = Py_BuildValue("(S)", aPyHashMap["Address"]);
-            aPyHashMap["WebSocket"]  = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["Arguments"]);
+    if (aPyHashMap["TWebSocket"] == NULL) {
+        throw TPyExcept("");
+    }
 
-            if (aPyHashMap["WebSocket"] == NULL) {
-                throw TPyExcept("");
-            }
+    aPyHashMap["arg.Address"]   = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
+    aPyHashMap["arg.Arguments"] = Py_BuildValue("(S)", aPyHashMap["arg.Address"]);
+    PyObject *aEezzWebsocket    = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["arg.Arguments"]);
 
-            aPyHashMap["ResultStart"] = PyObject_CallMethod(aPyHashMap["WebSocket"], "start", NULL);
-            // aPyHashMap["ResultJoin"]  = PyObject_CallMethod(aPyHashMap["WebSocket"], "join", NULL);
-        }
-        catch (TPyExcept& xEx) {
-            // ap_log_error(APLOG_MARK, APLOG_ERR, 0, r->server, "Failed to load websocket");
+    if (aEezzWebsocket == NULL) {
+        throw TPyExcept("");
+    }
+    PyObject_CallMethod(aEezzWebsocket, "start", NULL);
+    aPyHashMap["Import"] = Py_BuildValue("s", "eezz.agent");
+    aPyHashMap["Module"] = PyImport_Import(aPyHashMap["Import"]);
+
+    if (aPyHashMap["Module"] == NULL) {
+        throw TPyExcept("");
+    }
+
+    aPyHashMap["DocRoot"]    = Py_BuildValue("s",    mConfig.mDocumentRoot.c_str());
+    aPyHashMap["Address"]    = Py_BuildValue("(si)", mConfig.mHostname, mConfig.mWebsocket);
+    aPyHashMap["Arguments"]  = Py_BuildValue("(SS)", aPyHashMap["DocRoot"], aPyHashMap["Address"]);
+    aPyHashMap["TEezzAgent"] = PyObject_GetAttrString(aPyHashMap["Module"], "TEezzAgent");
+
+    if (aPyHashMap["TEezzAgent"] == NULL) {
+        throw TPyExcept("");
+    }
+
+
+    for (;;) {
+        TPyHash aPyLocalMap;
+        aPyLocalMap["Agent"]      = PyObject_CallObject(aPyHashMap["TEezzAgent"], aPyHashMap["Arguments"]);
+        aPyLocalMap["ResultHdle"] = PyObject_CallMethod(aPyLocalMap["Agent"], "handle_request", "s", mConfig.mRequest->filename);
+
+        // Send the result
+        Py_ssize_t aSize;
+        string     aAsciiResult;
+        wchar_t *aStringRes = PyUnicode_AsWideCharString(aPyLocalMap["ResultHdle"], &aSize);
+        if (aStringRes == NULL) {
             PyErr_Print();
+            break;
+            // throw TPyExcept("");
         }
+        wstring_convert<codecvt_utf8<wchar_t>> xConvert;
+        aAsciiResult = xConvert.to_bytes(aStringRes);
+
+        ap_set_content_type(mConfig.mRequest, "text/html");
+        ap_rprintf(mConfig.mRequest, aAsciiResult.c_str());
+
+        PyMem_Free(aStringRes);
+
+        aPyLocalMap["ResultShut"] = PyObject_CallMethod(aPyLocalMap["Agent"], "shutdown", NULL);
+
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        aPythonReady = true;
+        mReady.notify_all();
+        mReady.wait(lck);
     }
 }
+
 
 // ------------------------------------------------------------
 // Next steps:
@@ -215,95 +266,27 @@ void startWebSocket() {
 // ------------------------------------------------------------
 extern "C" static int eezz_handler(request_rec *r) {
     // Initialize Python runtime
-    TPyHash aPyHashMap;
-    int     aReturn = OK;
-    ostringstream aDocRoot;
-    ostringstream aAppRoot;
+    int aReturn = OK;
 
-    if (!r->handler || strcmp(r->handler, "eezz_websocket")) 
+    if (!r->handler || strcmp(r->handler, "eezz_websocket")) {
         return (DECLINED);
-    
-    // TEezzConfig *aConfig = (TEezzConfig *)ap_get_module_config(r-> r->per_dir_config, &eezz_websocket_module);
+    }
 
-    aDocRoot << r->htaccess->dir << "/public" << ends;
-    aAppRoot << r->htaccess->dir << "/applications/EezzServer" << ends;
+    mConfig.mRequest = r;
+    aPythonReady     = false;
+    mReady.notify_all();
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "eezz_handler");
-    
-    // Handle the reference count of PyObjects
-    TGuardObjects aObjGuard(&aPyHashMap);
 
     if (aPythonMtx.try_lock()) {
-        string aFilePath(r->canonical_filename);
-        size_t aPos  = aFilePath.find("webroot");
-        ostringstream aPath;
-        Py_SetProgramName(L"eezz_websocket_handler");
-        Py_Initialize();
-        
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "initialize %s", aPath.str().c_str());
-        aPyHashMap["sys.Import"]   = Py_BuildValue("s", "sys");
-        aPyHashMap["sys.Module"]   = PyImport_Import(aPyHashMap["sys.Import"]);
-        aPyHashMap["sys.path"]     = PyObject_GetAttrString(aPyHashMap["sys.Module"], "path");
-        
-        for (string aSegment : mConfig.mPathList) {
-            PyObject_CallMethod( aPyHashMap["sys.path"], "append", "s", aSegment.c_str() );
-        }
-
-        //aPyHashMap["sys.path.ref"] = PyObject_CallMethod(aPyHashMap["sys.path"], "extend", "[sssss]", 
-        //    "C:\\Python34\\DLLs", 
-        //    "C:\\Python34\\lib", 
-        //    "C:\\Python34", 
-        //    "C:\\Python34\\lib\\site-packages",
-        //    "C:\\Users\\Paul\\gitdev\\eezzgit\\webroot\\applications\\EezzServer");
-
-        // Start web socket
-        if (mConfig.mHostname.length() < 1) {
-            mConfig.mHostname = r->hostname;
-        }
-        startWebSocket();
+        string aFile = r->filename;
+        size_t aPos  = aFile.find(r->uri);
+        mConfig.mDocumentRoot = aFile.substr(0, aPos);
+        mThread = new thread(runPython);        
     }
-    
-    // Start the agent
-    try {
-        aPyHashMap["Import"]     = Py_BuildValue("s", "eezz.agent");
-        aPyHashMap["Module"]     = PyImport_Import(aPyHashMap["Import"]);
 
-        if (aPyHashMap["Module"] == NULL) {
-            throw TPyExcept("");
-        }
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "load eezz.agent");
+    std::unique_lock<std::mutex> lck(aReadyMtx);
+    while (!aPythonReady) mReady.wait(lck);
 
-        aPyHashMap["DocRoot"]    = Py_BuildValue("s", aDocRoot.str().c_str());
-        aPyHashMap["Address"]    = Py_BuildValue("(si)", "localhost", 8100);
-        aPyHashMap["Arguments"]  = Py_BuildValue("(SS)", aPyHashMap["DocRoot"], aPyHashMap["Address"]);
-        aPyHashMap["TEezzAgent"] = PyObject_GetAttrString(aPyHashMap["Module"], "TEezzAgent");
- 
-        if (aPyHashMap["TEezzAgent"] == NULL) {
-            throw TPyExcept("");
-        }
-        aPyHashMap["Agent"]      = PyObject_CallObject(aPyHashMap["TEezzAgent"], aPyHashMap["Arguments"]);
-        if (aPyHashMap["Agent"] == NULL) {
-            throw TPyExcept("");
-        }
-        aPyHashMap["ResultHdle"] = PyObject_CallMethod(aPyHashMap["Agent"], "handle_request", "(sSiS)", r->filename, Py_None, 0, Py_None);
-
-        // Send the result
-        Py_ssize_t aSize;
-        wchar_t *aStringRes = PyUnicode_AsWideCharString(aPyHashMap["ResultHdle"], &aSize);
-        wstring_convert<codecvt_utf8<wchar_t>> xConvert;
-        string aAsciiResult = xConvert.to_bytes(aStringRes);
-
-        ap_set_content_type(r, "text/html");
-        ap_rprintf(r, aAsciiResult.c_str());
-
-        PyMem_Free(aStringRes);
-        aPyHashMap["ResultShut"] = PyObject_CallMethod(aPyHashMap["Agent"], "shutdown", NULL);
-    }
-    catch (TPyExcept& xEx) {
-        PyErr_Print();
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "Failed to load agent");
-        aReturn = HTTP_INTERNAL_SERVER_ERROR;
-    }    
     return aReturn;
 }
 
