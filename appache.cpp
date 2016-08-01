@@ -18,6 +18,7 @@
 
 // #include <iostream>
 #include <stdio.h>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <condition_variable>
@@ -30,6 +31,7 @@
 #include <sstream>
 #include <stdio.h>
 #include <string.h>
+#include <fstream> 
 
 #include "apr_hash.h"
 #include "ap_config.h"
@@ -48,10 +50,10 @@ using namespace std;
 static   mutex  aMutex;
 static   condition_variable mCv;
 static   condition_variable mReady;
-static   mutex  aPythonMtx;
-static   mutex  aReadyMtx;
-static   bool   aPythonBusy = true;
-thread  *mThread;
+static   mutex   aPythonMtx;
+static   mutex   aReadyMtx;
+static   bool    aPythonBusy = true;
+static   thread *mThread;
 typedef  hash_map<string, PyObject*> TPyHash;
 
 // ------------------------------------------------------------
@@ -164,6 +166,7 @@ public:
     }
 };
 
+
 // ------------------------------------------------------------
 // startWebSocket
 // Prevent from starting twice using mutex
@@ -173,16 +176,88 @@ public:
 // port
 // webroot for python application
 // ------------------------------------------------------------
+PyObject* runWebSocket() {
+    TPyHash aPyHashMap;
+
+    aPyHashMap["websocket.Import"] = Py_BuildValue("s", "eezz.websocket");
+    aPyHashMap["websocket.Module"] = PyImport_Import(aPyHashMap["websocket.Import"]);
+
+    if (aPyHashMap["websocket.Module"] == NULL) {
+        throw TPyExcept("");
+    }
+    //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "load eezz.websocket");
+    aPyHashMap["TWebSocket"] = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWebSocket");
+
+    if (aPyHashMap["TWebSocket"] == NULL) {
+        throw TPyExcept("");
+    }
+    aPyHashMap["aSemaphore"]    = PyObject_GetAttrString(aPyHashMap["TWebSocket"], "mSemaphore");
+    aPyHashMap["arg.Address"]   = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
+    aPyHashMap["arg.Arguments"] = Py_BuildValue("(S)", aPyHashMap["arg.Address"]);
+    PyObject *aEezzWebsocket    = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["arg.Arguments"]);
+
+    if (aEezzWebsocket == NULL) {
+        throw TPyExcept("");
+    }
+    PyObject_CallMethod(aEezzWebsocket, "start", NULL);
+    PyObject_CallMethod(aPyHashMap["aSemaphore"], "acquire", NULL);
+    {
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        aPythonBusy = false;
+        mReady.notify_all();
+    }
+    return aEezzWebsocket;
+    //PyObject_CallMethod(aEezzWebsocket, "join", NULL);
+}
+
+void runAgent() {
+    TPyHash aPyHashMap;
+
+
+    aPyHashMap["Import"] = Py_BuildValue("s", "eezz.agent");
+    aPyHashMap["Module"] = PyImport_Import(aPyHashMap["Import"]);
+
+    if (aPyHashMap["Module"] == NULL) {
+        throw TPyExcept("");
+    }
+
+    aPyHashMap["DocRoot"] = Py_BuildValue("s", mConfig.mDocumentRoot.c_str());
+    aPyHashMap["Address"] = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
+    aPyHashMap["Arguments"] = Py_BuildValue("(SS)", aPyHashMap["DocRoot"], aPyHashMap["Address"]);
+    aPyHashMap["TEezzAgent"] = PyObject_GetAttrString(aPyHashMap["Module"], "TEezzAgent");
+
+    if (aPyHashMap["TEezzAgent"] == NULL) {
+        throw TPyExcept("");
+    }
+    aPyHashMap["Agent"] = PyObject_CallObject(aPyHashMap["TEezzAgent"], aPyHashMap["Arguments"]);
+    aPyHashMap["ResultHdle"] = PyObject_CallMethod(aPyHashMap["Agent"], "handle_request", "s", mConfig.mRequest->filename);
+
+    // Send the result
+    Py_ssize_t aSize;
+    string     aAsciiResult;
+    wchar_t   *aStringRes = PyUnicode_AsWideCharString(aPyHashMap["ResultHdle"], &aSize);
+    if (aStringRes == NULL) {
+        PyErr_Print();
+    }
+    else {
+        wstring_convert<codecvt_utf8<wchar_t>> xConvert;
+        aAsciiResult = xConvert.to_bytes(aStringRes);
+
+        ap_set_content_type(mConfig.mRequest, "text/html");
+        ap_rprintf(mConfig.mRequest, "%s", aAsciiResult.c_str());
+        PyMem_Free(aStringRes);
+    }
+    aPyHashMap["ResultShut"] = PyObject_CallMethod(aPyHashMap["Agent"], "shutdown", NULL);
+}
+
 void runPython() {
     TPyHash aPyHashMap;
-    
-    // Initialize thread
     Py_SetProgramName(L"eezz_websocket_handler");
     Py_Initialize();
 
     aPyHashMap["sys.Import"] = Py_BuildValue("s", "sys");
     aPyHashMap["sys.Module"] = PyImport_Import(aPyHashMap["sys.Import"]);
-    aPyHashMap["sys.path"]   = PyObject_GetAttrString(aPyHashMap["sys.Module"], "path");
+    aPyHashMap["sys.path"] = PyObject_GetAttrString(aPyHashMap["sys.Module"], "path");
 
     for (string aSegment : mConfig.mPathList) {
         PyObject_CallMethod(aPyHashMap["sys.path"], "append", "s", aSegment.c_str());
@@ -196,20 +271,21 @@ void runPython() {
         throw TPyExcept("");
     }
     //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "load eezz.websocket");
-    aPyHashMap["TWebSocket"] = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWebSocket");
-
-    if (aPyHashMap["TWebSocket"] == NULL) {
-        throw TPyExcept("");
-    }
+    aPyHashMap["TWebSocket"]    = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWebSocket");
+    aPyHashMap["TWakeup"]       = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWakeup");
+    aPyHashMap["aCvExtern"]     = PyObject_GetAttrString(aPyHashMap["TWakeup"], "mCvExtern");
 
     aPyHashMap["arg.Address"]   = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
     aPyHashMap["arg.Arguments"] = Py_BuildValue("(S)", aPyHashMap["arg.Address"]);
-    PyObject *aEezzWebsocket    = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["arg.Arguments"]);
+    aPyHashMap["aWebSocket"]    = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["arg.Arguments"]);
+    aPyHashMap["aWakeup"]       = PyObject_CallObject(aPyHashMap["TWakeup"], NULL);
 
-    if (aEezzWebsocket == NULL) {
+    if (aPyHashMap["aWebSocket"] == NULL) {
         throw TPyExcept("");
     }
-    PyObject_CallMethod(aEezzWebsocket, "start", NULL);
+    PyObject_CallMethod(aPyHashMap["aWebSocket"], "start", NULL);
+    PyObject_CallMethod(aPyHashMap["aWakeup"],    "start", NULL);
+
     aPyHashMap["Import"] = Py_BuildValue("s", "eezz.agent");
     aPyHashMap["Module"] = PyImport_Import(aPyHashMap["Import"]);
 
@@ -218,18 +294,27 @@ void runPython() {
     }
 
     aPyHashMap["DocRoot"]    = Py_BuildValue("s",    mConfig.mDocumentRoot.c_str());
-    aPyHashMap["Address"]    = Py_BuildValue("(si)", mConfig.mHostname, mConfig.mWebsocket);
+    aPyHashMap["Address"]    = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
     aPyHashMap["Arguments"]  = Py_BuildValue("(SS)", aPyHashMap["DocRoot"], aPyHashMap["Address"]);
     aPyHashMap["TEezzAgent"] = PyObject_GetAttrString(aPyHashMap["Module"], "TEezzAgent");
 
     if (aPyHashMap["TEezzAgent"] == NULL) {
         throw TPyExcept("");
     }
-
+    else {
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        mReady.notify_all();
+    }
 
     for (;;) {
+        // Suspend the python thread, waiting to handle requests
+        PyObject_CallMethod(aPyHashMap["aCvExtern"], "acquire", NULL);
+        PyObject_CallMethod(aPyHashMap["aCvExtern"], "wait",    NULL);
+        PyObject_CallMethod(aPyHashMap["aCvExtern"], "release", NULL);
+        //PyObject_CallMethod(aPyHashMap["aWakeup"], "join", NULL);
+
         TPyHash aPyLocalMap;
-        aPyLocalMap["Agent"]      = PyObject_CallObject(aPyHashMap["TEezzAgent"], aPyHashMap["Arguments"]);
+        aPyLocalMap["Agent"] = PyObject_CallObject(aPyHashMap["TEezzAgent"], aPyHashMap["Arguments"]);
         aPyLocalMap["ResultHdle"] = PyObject_CallMethod(aPyLocalMap["Agent"], "handle_request", "s", mConfig.mRequest->filename);
 
         // Send the result
@@ -238,26 +323,25 @@ void runPython() {
         wchar_t   *aStringRes = PyUnicode_AsWideCharString(aPyLocalMap["ResultHdle"], &aSize);
         if (aStringRes == NULL) {
             PyErr_Print();
-            break;
-            // throw TPyExcept("");
         }
-        wstring_convert<codecvt_utf8<wchar_t>> xConvert;
-        aAsciiResult = xConvert.to_bytes(aStringRes);
+        else {
+            wstring_convert<codecvt_utf8<wchar_t>> xConvert;
+            aAsciiResult = xConvert.to_bytes(aStringRes);
 
-        ap_set_content_type(mConfig.mRequest, "text/html");
-        ap_rprintf(mConfig.mRequest, aAsciiResult.c_str());
-
-        PyMem_Free(aStringRes);
-
+            ap_set_content_type(mConfig.mRequest, "text/html");
+            ap_rprintf(mConfig.mRequest, "%s", aAsciiResult.c_str());
+            PyMem_Free(aStringRes);
+        }
         aPyLocalMap["ResultShut"] = PyObject_CallMethod(aPyLocalMap["Agent"], "shutdown", NULL);
 
+        // Yield the calling thread, which waits on mReady mutex 
         std::unique_lock<std::mutex> lck(aReadyMtx);
         aPythonBusy = false;
         mReady.notify_all();
-        mReady.wait(lck);
     }
 }
 
+#include <winsock.h>
 
 // ------------------------------------------------------------
 // Next steps:
@@ -266,7 +350,11 @@ void runPython() {
 // ------------------------------------------------------------
 extern "C" static int eezz_handler(request_rec *r) {
     // Initialize Python runtime
-    int aReturn = OK;
+    TPyHash xPyHashMap;
+    int     aReturn = OK;
+    WSADATA aWsa;
+    static bool aInitial = true;
+    struct sockaddr_in aServerAddr;
 
     if (!r->handler || strcmp(r->handler, "eezz_websocket")) {
         return (DECLINED);
@@ -276,15 +364,31 @@ extern "C" static int eezz_handler(request_rec *r) {
     aPythonBusy      = true;
     mReady.notify_all();
 
-    if (aPythonMtx.try_lock()) {
+    if (aInitial) {
+        aInitial = false;
+        WSAStartup(MAKEWORD(2, 2), &aWsa);
+
         string aFile = r->filename;
         size_t aPos  = aFile.find(r->uri);
         mConfig.mDocumentRoot = aFile.substr(0, aPos);
-        mThread = new thread(runPython);        
-    }
+        aPythonBusy  = true;
+        mThread      = new thread(runPython); 
 
-    if (aPythonBusy) {
+        // wait for the python to initialize
         std::unique_lock<std::mutex> lck(aReadyMtx);
+        mReady.wait(lck);
+    }
+    
+    // Wakeup the python process
+    SOCKET  aSocket = socket(AF_INET, SOCK_STREAM, 0);
+    aServerAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    aServerAddr.sin_family = AF_INET;
+    aServerAddr.sin_port   = htons(63000);
+    connect(aSocket, (struct sockaddr *)&aServerAddr, sizeof(aServerAddr));
+
+    // Wait for the python thread to finish
+    std::unique_lock<std::mutex> lck(aReadyMtx);
+    if (aPythonBusy) {
         mReady.wait(lck);
     }
     return aReturn;

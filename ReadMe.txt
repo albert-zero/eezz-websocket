@@ -24,3 +24,26 @@ DocumentRoot /apache/httpdoc/webroot/public
 </Files>
 
 ----- httpd.conf ----------------------------
+
+
+The Project:
+The Python-API runs in one dedicated thread. Its not possible to assign any variable or any method call from
+different threads. 
+
+Another restriction is, that suspending this thread using C++ mutex would also suspend all Python child threads.
+The Websocket implementation has many threads and would not work.
+
+In the design all Python-API is gathered in a single function, which is then threaded.
+The communication between Apache handler and Python-API is done via global configuration.
+
+The synchronization between the handler and the Python thread is done with condition 
+aReadyMtx and predicate aPythonBusy
+
+The Python module websocket implements the class TWakeup, which could be triggered on connect 
+socket ('localhost', 6300)
+
+A connect would trigger the mutex TWakeup.aCvExtern, which is used to suspend the Python main thread
+
+
+
+ 
