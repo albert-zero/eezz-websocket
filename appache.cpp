@@ -17,8 +17,6 @@
 // #define AP_HAVE_DESIGNATED_INITIALIZER
 
 // #include <iostream>
-#include <Winsock2.h>
-#include <Ws2ipdef.h>
 #include <stdio.h>
 #include <iostream>
 #include <string>
@@ -33,22 +31,11 @@
 #include <sstream>
 #include <stdio.h>
 #include <string.h>
-#include <strstream>
 #include <fstream> 
-#include <iostream>
-#include <map>
 
 #include "apr_hash.h"
-#include "apr_strings.h"
-#include "apr_sha1.h"
-#include "apr_base64.h"
-#include "apr_tables.h"
-#include "apr_pools.h"
-#include "apr_file_io.h"
-
 #include "ap_config.h"
 #include "ap_provider.h"
-
 #include "httpd.h"
 #include "http_core.h"
 #include "http_config.h"
@@ -57,9 +44,9 @@
 #include "http_request.h"
 
 #undef _DEBUG
+#include <Python.h>
 
 using namespace std;
-
 static   mutex  aMutex;
 static   condition_variable mCv;
 static   condition_variable mReady;
@@ -67,11 +54,7 @@ static   mutex   aPythonMtx;
 static   mutex   aReadyMtx;
 static   bool    aPythonBusy = true;
 static   thread *mThread;
-
-class TWebSocketException : public exception {
-public:
-    TWebSocketException() {};
-};
+typedef  hash_map<string, PyObject*> TPyHash;
 
 // ------------------------------------------------------------
 // ------------------------------------------------------------
@@ -80,35 +63,77 @@ typedef struct {
     int            mWebsocket;
     string         mHostname;
     string         mDocumentRoot;
-    apr_pool_t    *mPool;
     request_rec   *mRequest;
 } TEezzConfig;
 
-typedef struct {
-    int           mState;
-    apr_pool_t   *mPool;
-    apr_pollfd_t  mClientPfd;
-    apr_pollfd_t  mServerPfd;
-    apr_socket_t *mServer;
-    apr_socket_t *mClient;
-    bool          mFinal;
-    bool          mMasked;
-    unsigned char mOpcode;
-    char          mVector[4];
-    char          mBuffer[65536 * 2];
-    UINT64        mPayload;
-    UINT64        mRest;
+// ------------------------------------------------------------
+// Takes a mutex and tries to lock it. I would also accept a
+// mutex which is already locked. 
+// Unlocks the given mutex at the end of the scope.
+// ------------------------------------------------------------
+class TGuard {
+private:
+    mutex *mMutex;
+public:
+    TGuard(mutex *aMutex) {
+        mMutex = aMutex;
+        mMutex->try_lock();
+    }
+    ~TGuard() {
+        mMutex->unlock();
+    }
+};
 
-} TConnection;
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+class TGuardObjects {
+private:
+    TPyHash *aPythonObjects;
+public:
+    TGuardObjects(TPyHash *aObjects) {
+        aPythonObjects = aObjects;
+    }
+    ~TGuardObjects() {
+        for (auto xEntry : *aPythonObjects) {
+            Py_XDECREF(xEntry.second);
+        }
+    }
+};
 
-static TEezzConfig gConfig;
+static TEezzConfig mConfig;
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+const char *setPythonPath(cmd_parms *cmd, void *cfg, const char *arg) {
+    istringstream aPath(arg);
+    string        aSegment;
+
+    while (std::getline(aPath, aSegment, ':')) {
+        mConfig.mPathList.push_back(aSegment);
+    }
+    return NULL;
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+const char *setWebsocket(cmd_parms *cmd, void *cfg, const char *arg) {
+    mConfig.mWebsocket = atoi(arg);
+    return NULL;
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
+const char *setHostname(cmd_parms *cmd, void *cfg, const char *arg) {
+    mConfig.mHostname = arg;
+    return NULL;
+}
 
 // ------------------------------------------------------------
 // ------------------------------------------------------------
 static const command_rec directives[] = {
-    //AP_INIT_TAKE1("PythonPath", reinterpret_cast<cmd_func>(setPythonPath), NULL, ACCESS_CONF, "set the python path"),
-    //AP_INIT_TAKE1("Websocket",  reinterpret_cast<cmd_func>(setWebsocket),  NULL, ACCESS_CONF, "set websocket port"),
-    //AP_INIT_TAKE1("WsHostname", reinterpret_cast<cmd_func>(setHostname),   NULL, ACCESS_CONF, "set websocket host"),
+    AP_INIT_TAKE1("PythonPath", reinterpret_cast<cmd_func>(setPythonPath), NULL, ACCESS_CONF, "set the python path"),
+    AP_INIT_TAKE1("Websocket",  reinterpret_cast<cmd_func>(setWebsocket),  NULL, ACCESS_CONF, "set websocket port"),
+    AP_INIT_TAKE1("WsHostname", reinterpret_cast<cmd_func>(setHostname),   NULL, ACCESS_CONF, "set websocket host"),
     { NULL }
 };
 
@@ -121,346 +146,176 @@ extern "C" module AP_MODULE_DECLARE_DATA eezz_websocket_module = {
     NULL,
     NULL,
     NULL,
-    NULL,
+    directives,
     register_hooks
 };
 
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-void genHandshake(request_rec *r) {
-    string         x64Key;
-    apr_size_t     xLen;
-    char           x64Hash[APR_SHA1_DIGESTSIZE * 3];
-    unsigned char  xDigest[APR_SHA1_DIGESTSIZE];
-    apr_sha1_ctx_t aSha1;
-
-    x64Key = apr_table_get(r->headers_in, "Sec-WebSocket-Key");
-    x64Key.append("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-
-    apr_sha1_init(&aSha1);
-    apr_sha1_update(&aSha1, x64Key.c_str(), x64Key.length());
-    apr_sha1_final(xDigest, &aSha1);
-
-    xLen = apr_base64_encode(x64Hash, (const char*)xDigest, APR_SHA1_DIGESTSIZE);
-
-    apr_table_clear(r->headers_out);
-    apr_table_set(r->headers_out, "Connection", "Upgrade");
-    apr_table_set(r->headers_out, "Upgrade", "websocket");
-    apr_table_set(r->headers_out, "Sec-WebSocket-Accept", x64Hash);
-
-    r->status      = HTTP_SWITCHING_PROTOCOLS;
-    r->status_line = ap_get_status_line(r->status);
-    r->connection->keepalive = AP_CONN_KEEPALIVE;
-    ap_send_interim_response(r, 1);
-}
 
 // ------------------------------------------------------------
+// Define an exception to interrupt Python processing
+// and decrement reference to allocated variables
 // ------------------------------------------------------------
-void writeHandshake(request_rec *r, TConnection *aConnection) {
-    apr_status_t xState;
-    const apr_array_header_t *tarr = apr_table_elts(r->headers_in);
-    const apr_table_entry_t *telts = (const apr_table_entry_t*)tarr->elts;
-    int i;
-
-    ostrstream oss;
-    oss << "HTTP/1.1 101 Switching Protocols\r\n";
-    for (i = 0; i < tarr->nelts; i++) {
-        oss << telts[i].key << ":" << telts[i].val << "\r\n";
+class TPyExcept : public exception {
+    string mMessage;
+public:
+    TPyExcept(string aMessage) {
+        mMessage = aMessage;
     }
-    oss << "\r\n";
-    apr_size_t aLen = oss.pcount();
-    xState = apr_socket_send(aConnection->mClient, oss.str(), &aLen);
-    if (!xState) {
-        throw(TWebSocketException());
+    virtual const char* what() const throw() {
+        return mMessage.c_str();
     }
-}
+};
 
 // ------------------------------------------------------------
+// The Python thread
+// Python would not allow to change threads, so all calls 
+// have to be gathered in this method
+// This makes sychonization necessary using conditions, 
+// mutex and a wakeup socket
 // ------------------------------------------------------------
-typedef union {
-    char         mBuffer[8];
-    apr_int16_t  mShort;
-    apr_int64_t  mLong;
-} TBytes;
+void runPython() {
+    TPyHash aPyHashMap;
+    Py_SetProgramName(L"eezz_websocket_handler");
+    Py_Initialize();
 
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-void readHeader(TConnection *xConnection) {
-    TBytes       xBytes;
-    apr_status_t xState;
-    apr_size_t   xLen;
+    aPyHashMap["sys.Import"]    = Py_BuildValue("s", "sys");
+    aPyHashMap["sys.Module"]    = PyImport_Import(aPyHashMap["sys.Import"]);
+    aPyHashMap["sys.path"]      = PyObject_GetAttrString(aPyHashMap["sys.Module"], "path");
 
-    xLen   = 2;
-    xState = apr_socket_recv(xConnection->mServer, xBytes.mBuffer, &xLen);
-    if (xLen <= 0) {
-        throw(TWebSocketException());
+    for (string aSegment : mConfig.mPathList) {
+        PyObject_CallMethod(aPyHashMap["sys.path"], "append", "s", aSegment.c_str());
     }
 
-    xConnection->mFinal = ((1 << 7) & xBytes.mBuffer[0]) != 0;
-    xConnection->mOpcode = xBytes.mBuffer[0] & 0xf;
-    xConnection->mMasked = ((1 << 7) & xBytes.mBuffer[1]) != 0;
-    xConnection->mPayload = (int)(xBytes.mBuffer[1] & 0x7f);
+    // start websocket
+    aPyHashMap["websocket.Import"] = Py_BuildValue("s", "eezz.websocket");
+    aPyHashMap["websocket.Module"] = PyImport_Import(aPyHashMap["websocket.Import"]);
 
-    if (xConnection->mPayload == 126) {
-        xBytes.mLong = 0;
-        xState = apr_socket_recv(xConnection->mServer, xBytes.mBuffer, &xLen);
-        xConnection->mPayload = ntohs(xBytes.mLong);
+    if (aPyHashMap["websocket.Module"] == NULL) {
+        throw TPyExcept("");
     }
-    else if (xConnection->mPayload == 127) {
-        xBytes.mLong = 0;
-        xState = apr_socket_recv(xConnection->mServer, xBytes.mBuffer, &xLen);
-        xConnection->mPayload = ntohll(xBytes.mLong);
+    //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, "load eezz.websocket");
+    aPyHashMap["TWebSocket"]    = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWebSocket");
+    aPyHashMap["TWakeup"]       = PyObject_GetAttrString(aPyHashMap["websocket.Module"], "TWakeup");
+    aPyHashMap["aCvExtern"]     = PyObject_GetAttrString(aPyHashMap["TWakeup"], "mCvExtern");
+
+    aPyHashMap["arg.Address"]   = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
+    aPyHashMap["arg.Arguments"] = Py_BuildValue("(S)", aPyHashMap["arg.Address"]);
+    aPyHashMap["aWebSocket"]    = PyObject_CallObject(aPyHashMap["TWebSocket"], aPyHashMap["arg.Arguments"]);
+    aPyHashMap["aWakeup"]       = PyObject_CallObject(aPyHashMap["TWakeup"], NULL);
+
+    if (aPyHashMap["aWebSocket"] == NULL) {
+        throw TPyExcept("");
     }
+    PyObject_CallMethod(aPyHashMap["aWebSocket"], "start", NULL);
+    PyObject_CallMethod(aPyHashMap["aWakeup"],    "start", NULL);
 
-    if (xLen <= 0) {
-        throw(TWebSocketException());
-    }
+    aPyHashMap["Import"] = Py_BuildValue("s", "eezz.agent");
+    aPyHashMap["Module"] = PyImport_Import(aPyHashMap["Import"]);
 
-    if (xConnection->mMasked) {
-        xLen   = 4;
-        xState = apr_socket_recv(xConnection->mServer, xConnection->mVector, &xLen);
-        if (xLen != 4) {
-            throw(TWebSocketException());
-        }
-    }
-}
-
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-bool readFrame(TConnection *xConnection) {
-    apr_size_t   xLen;
-    apr_size_t   xRest;
-    apr_status_t xState;
-    ostrstream   oss;
-    bool         mFinal = false;
-
-    if (xConnection->mRest == 0) {
-        return true;
+    if (aPyHashMap["Module"] == NULL) {
+        throw TPyExcept("");
     }
 
-    xLen   = sizeof(xConnection->mBuffer);
-    xState = apr_socket_recv(xConnection->mServer, xConnection->mBuffer, &xLen);
-    if (xLen <= 0) {
-        throw(TWebSocketException());
-    }
+    aPyHashMap["DocRoot"]      = Py_BuildValue("s",    mConfig.mDocumentRoot.c_str());
+    aPyHashMap["Address"]      = Py_BuildValue("(si)", mConfig.mHostname.c_str(), mConfig.mWebsocket);
+    aPyHashMap["Arguments"]    = Py_BuildValue("(SS)", aPyHashMap["DocRoot"], aPyHashMap["Address"]);
+    aPyHashMap["TEezzAgent"]   = PyObject_GetAttrString(aPyHashMap["Module"], "TEezzAgent");
 
-    xConnection->mRest -= xLen;
-
-    if (xConnection->mMasked) {
-        for (int i = 0; i < xLen; i++) {
-            xConnection->mBuffer[i] ^= xConnection->mVector[i % 4];
-        }
-    }
-    return (xConnection->mRest == 0);
-}
-
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-void writeFrame(TConnection *xConnection) {
-    TBytes       xBytes;
-    char         xBuffer[4096];
-    int          xPos = 0;
-    int          xMasked = 0;
-    apr_size_t   xLen = 4096 - 1;
-    apr_status_t xState;
-
-    xBuffer[xPos++] = xConnection->mFinal | xConnection->mOpcode;
-    if (xConnection->mMasked) {
-        xMasked = 1 << 7;
-    }
-
-    if (xConnection->mPayload >= 126) {
-        if (xConnection->mPayload < 0xffff) {
-            xBuffer[xPos++] = 0x7e | xMasked;
-            xBytes.mShort = htons(xConnection->mPayload);
-            for (int i = 0; i < 2; i++) {
-                xBuffer[xPos++] = xBytes.mBuffer[i];
-            }
-        }
-        else {
-            xBuffer[xPos++] = 0x7f | xMasked;
-            xBytes.mLong = htons(xConnection->mPayload);
-            for (int i = 0; i < 8; i++) {
-                xBuffer[xPos++] = xBytes.mBuffer[i];
-            }
-        }
+    if (aPyHashMap["TEezzAgent"] == NULL) {
+        throw TPyExcept("");
     }
     else {
-        xBuffer[xPos++] = xConnection->mPayload | xMasked;
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        mReady.notify_all();
     }
-
-    if (xConnection->mMasked) {
-        for (int i = 0; i < xConnection->mPayload; i++) {
-            xBuffer[i] ^= xConnection->mVector[i % 4];
-        }
-    }
-
-    xLen   = xPos + xConnection->mPayload;
-    xState = apr_socket_send(xConnection->mServer, xBuffer, &xLen);
-    if (xState != APR_SUCCESS) {
-        throw(TWebSocketException());
-    }
-}
-
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-void wsproxy(request_rec *r, TConnection *xConnection) {
-    apr_size_t      xLen;
-    apr_pollset_t  *xPollset;
-    apr_pollfd_t    xPfd;
-    apr_pollfd_t   *xRetPfd;
-    apr_int32_t     xNum;
-    apr_status_t    xState;
-    apr_sockaddr_t *xAddress;
-    
-    apr_pollset_create(&xPollset, 32, r->pool, 0);
-
-    xConnection->mServer = ap_get_conn_socket(r->connection);
-    xPfd = { r->pool, APR_POLL_SOCKET, APR_POLLIN, 0, { NULL }, xConnection };
-    xPfd.desc.s = xConnection->mServer;
-    apr_pollset_add(xPollset, &xPfd);
-
-    xState = apr_sockaddr_info_get(&xAddress, "localhost", APR_INET, 8401, 0, r->pool);
-    if (xState != APR_SUCCESS) {
-        throw(TWebSocketException());
-    }
-    xState = apr_socket_create(&(xConnection->mClient), APR_INET, SOCK_STREAM, APR_PROTO_TCP, r->pool);
-    xState = apr_socket_connect(xConnection->mClient, xAddress);
-    if (xState != APR_SUCCESS) {
-        xConnection->mClient = NULL;
-        throw(TWebSocketException());
-    }
-
-    xPfd = { r->pool, APR_POLL_SOCKET, APR_POLLIN, 0, { NULL }, xConnection };
-    xPfd.desc.s = xConnection->mClient;
-    apr_pollset_add(xPollset, &xPfd);
-
-    xConnection->mServerPfd = xPfd;
-    xConnection->mClientPfd = xPfd;
 
     for (;;) {
-        xState = apr_pollset_poll(xPollset, (APR_USEC_PER_SEC * 30), &xNum, (const apr_pollfd_t**)&xRetPfd);
-        if (xState != APR_SUCCESS) {
-            continue;
+        TPyHash aPyLocalMap;
+
+        // Suspend the python thread, waiting to handle requests
+        PyObject_CallMethod(aPyHashMap["aCvExtern"], "acquire", NULL);
+        PyObject_CallMethod(aPyHashMap["aCvExtern"], "wait",    NULL);
+        PyObject_CallMethod(aPyHashMap["aCvExtern"], "release", NULL);
+        //PyObject_CallMethod(aPyHashMap["aWakeup"], "join", NULL);
+
+        aPyLocalMap["Agent"] = PyObject_CallObject(aPyHashMap["TEezzAgent"], aPyHashMap["Arguments"]);
+        aPyLocalMap["ResultHdle"] = PyObject_CallMethod(aPyLocalMap["Agent"], "handle_request", "s", mConfig.mRequest->filename);
+
+        // Send the result
+        Py_ssize_t aSize;
+        string     aAsciiResult;
+        wchar_t   *aStringRes = PyUnicode_AsWideCharString(aPyLocalMap["ResultHdle"], &aSize);
+        if (aStringRes == NULL) {
+            PyErr_Print();
         }
+        else {
+            wstring_convert<codecvt_utf8<wchar_t>> xConvert;
+            aAsciiResult = xConvert.to_bytes(aStringRes);
 
-        for (int i = 0; i < xNum; i++) {
-            TConnection *aConnection = (TConnection*)xRetPfd[i].client_data;
-
-            if (xRetPfd[i].desc.s == aConnection->mServer) {
-                readHeader(aConnection);
-                int xOpcode = aConnection->mOpcode;
-
-                if (xOpcode == 0x9) {
-                    aConnection->mOpcode = 0xA;
-                    readFrame(aConnection);
-                    writeFrame(aConnection);
-                }
-
-                if (xOpcode == 0xA) {
-                    aConnection->mOpcode = 0x9;
-                    readFrame(aConnection);
-                    writeFrame(aConnection);
-                }
-
-                if (xOpcode == 0x1 || xOpcode == 0x2) {
-                    readFrame(aConnection);
-                    xLen   = aConnection->mPayload;
-                    xState = apr_socket_send(aConnection->mClient, aConnection->mBuffer, &xLen);
-                    if (xState != APR_SUCCESS) {
-                        throw(TWebSocketException());
-                    }
-                }
-            }
-
-            if (xRetPfd[i].desc.s == aConnection->mClient) {
-                xLen   = sizeof(aConnection->mBuffer);
-                xState = apr_socket_recv(aConnection->mClient, aConnection->mBuffer, &xLen);
-
-                if (xState != APR_SUCCESS) {
-                    throw(TWebSocketException());
-                }
-                aConnection->mFinal = true;
-                aConnection->mOpcode = 1;
-                aConnection->mPayload = xLen;
-                writeFrame(aConnection);
-            }
+            ap_set_content_type(mConfig.mRequest, "text/html");
+            ap_rprintf(mConfig.mRequest, "%s", aAsciiResult.c_str());
+            PyMem_Free(aStringRes);
         }
+        aPyLocalMap["ResultShut"] = PyObject_CallMethod(aPyLocalMap["Agent"], "shutdown", NULL);
+
+        // Yield the calling thread, which waits on mReady mutex 
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        aPythonBusy = false;
+        mReady.notify_all();
     }
 }
 
+#include <winsock.h>
 // ------------------------------------------------------------
+// Next steps:
+// configure sys path to the distribution
+// configure python path
 // ------------------------------------------------------------
 extern "C" static int eezz_handler(request_rec *r) {
-    TConnection     xConnection;
-    static bool     aInitialized = false;
-    int             aReturn;
-    apr_status_t    xState;
-    apr_sockaddr_t *xAddress;
-    char            xBuffer[1024];
-    char            aFileBuf[4096];
-    apr_size_t      xLen;
-    apr_file_t     *xFile;
-    apr_file_t     *xWsDef;
-    size_t xPos;
+    // Initialize Python runtime
+    TPyHash xPyHashMap;
+    int     aReturn = OK;
+    WSADATA aWsa;
+    static bool aInitial = true;
+    struct sockaddr_in aServerAddr;
 
-
-    if (!r->handler) {
-        return DECLINED;
-    }
-    const char *xUpgrade = apr_table_get(r->headers_in, "Upgrade");
-
-    // Generate the base document injecting the websocket scripts
-    if (strcmp(r->handler, "eezz_websocket") == 0) {
-        if (xUpgrade == NULL) {
-            string xPath = apr_pstrdup(r->pool, r->filename);
-            xPos = xPath.find_last_of('/');
-            xPath = xPath.substr(0, xPos) + "/../resources/websocket.js";
-
-            ifstream xifs = ifstream(r->filename);
-            ifstream xiws = ifstream(xPath);
-            ostrstream xbuf;
-
-            while (xifs.good()) {
-                xifs.getline(aFileBuf, 4096);
-                string xBuff = aFileBuf;
-
-                if ((xPos = xBuff.find("{websocket}")) != string::npos) {
-                    xbuf << xBuff.substr(0, xPos);
-                    xbuf << "var gSocketAddr   = \"ws://localhost:80\";" << endl;
-                    xbuf << "var eezzArguments = \"\";" << endl;
-
-                    while (xiws.good()) {
-                        xiws.getline(aFileBuf, 4096);
-                        xbuf << aFileBuf << endl;
-                    }
-                    xbuf << xBuff.substr(xPos + 11) << endl;
-                }
-                else {
-                    xbuf << xBuff << endl;
-                }
-            }
-            ap_rputs(xbuf.str(), r);
-            return OK;
-        }
+    if (!r->handler || strcmp(r->handler, "eezz_websocket")) {
+        return (DECLINED);
     }
 
-    if (xUpgrade == NULL || strcmp(xUpgrade, "websocket") != 0) {
-        return DECLINED;
-    }
+    mConfig.mRequest = r;
+    aPythonBusy      = true;
+    mReady.notify_all();
 
-    try {
-        genHandshake(r);
-        // ap_switch_protocol(r->connection, r, r->server, "websocket");
-        wsproxy(r, &xConnection);
-    }
-    catch (TWebSocketException &e) {
-        if (xConnection.mClient != NULL) {
-            apr_socket_close(xConnection.mClient);
-        }
-    }
+    if (aInitial) {
+        aInitial = false;
+        WSAStartup(MAKEWORD(2, 2), &aWsa);
 
-    return OK;
+        string aFile = r->filename;
+        size_t aPos  = aFile.find(r->uri);
+        mConfig.mDocumentRoot = aFile.substr(0, aPos);
+        aPythonBusy  = true;
+        mThread      = new thread(runPython); 
+
+        // wait for the python to initialize
+        std::unique_lock<std::mutex> lck(aReadyMtx);
+        mReady.wait(lck);
+    }
+    
+    // Wakeup the python process
+    SOCKET  aSocket = socket(AF_INET, SOCK_STREAM, 0);
+    aServerAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    aServerAddr.sin_family = AF_INET;
+    aServerAddr.sin_port   = htons(63000);
+    connect(aSocket, (struct sockaddr *)&aServerAddr, sizeof(aServerAddr));
+    closesocket(aSocket);
+
+    // Wait for the python thread to finish
+    std::unique_lock<std::mutex> lck(aReadyMtx);
+    if (aPythonBusy) {
+        mReady.wait(lck);
+    }
+    return aReturn;
 }
 
 // ------------------------------------------------------------
@@ -473,6 +328,6 @@ extern "C" static void register_hooks(apr_pool_t *pool) {
 // ------------------------------------------------------------
 // ------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    return 0;
+	return 0;
 }
 
