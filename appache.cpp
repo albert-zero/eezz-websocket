@@ -148,7 +148,7 @@ void genHandshake(request_rec *r) {
     apr_table_set(r->headers_out, "Upgrade", "websocket");
     apr_table_set(r->headers_out, "Sec-WebSocket-Accept", x64Hash);
 
-    r->status      = HTTP_SWITCHING_PROTOCOLS;
+    r->status = HTTP_SWITCHING_PROTOCOLS;
     r->status_line = ap_get_status_line(r->status);
     r->connection->keepalive = AP_CONN_KEEPALIVE;
     ap_send_interim_response(r, 1);
@@ -158,7 +158,10 @@ void genHandshake(request_rec *r) {
 // ------------------------------------------------------------
 void writeHandshake(request_rec *r, TConnection *aConnection) {
     apr_status_t xState;
-    const apr_array_header_t *tarr = apr_table_elts(r->headers_in);
+    char         xBuffer[4096];
+
+    apr_table_set(r->headers_out, "Upgrade", "peezz");
+    const apr_array_header_t *tarr = apr_table_elts(r->headers_out);
     const apr_table_entry_t *telts = (const apr_table_entry_t*)tarr->elts;
     int i;
 
@@ -170,7 +173,12 @@ void writeHandshake(request_rec *r, TConnection *aConnection) {
     oss << "\r\n";
     apr_size_t aLen = oss.pcount();
     xState = apr_socket_send(aConnection->mClient, oss.str(), &aLen);
-    if (!xState) {
+    if (xState != APR_SUCCESS) {
+        throw(TWebSocketException());
+    }
+    aLen   = sizeof(xBuffer);
+    xState = apr_socket_recv(aConnection->mClient, xBuffer, &aLen);
+    if (xState != APR_SUCCESS) {
         throw(TWebSocketException());
     }
 }
@@ -190,7 +198,7 @@ void readHeader(TConnection *xConnection) {
     apr_status_t xState;
     apr_size_t   xLen;
 
-    xLen   = 2;
+    xLen = 2;
     xState = apr_socket_recv(xConnection->mServer, xBytes.mBuffer, &xLen);
     if (xLen <= 0) {
         throw(TWebSocketException());
@@ -217,7 +225,7 @@ void readHeader(TConnection *xConnection) {
     }
 
     if (xConnection->mMasked) {
-        xLen   = 4;
+        xLen = 4;
         xState = apr_socket_recv(xConnection->mServer, xConnection->mVector, &xLen);
         if (xLen != 4) {
             throw(TWebSocketException());
@@ -238,7 +246,7 @@ bool readFrame(TConnection *xConnection) {
         return true;
     }
 
-    xLen   = sizeof(xConnection->mBuffer);
+    xLen = sizeof(xConnection->mBuffer);
     xState = apr_socket_recv(xConnection->mServer, xConnection->mBuffer, &xLen);
     if (xLen <= 0) {
         throw(TWebSocketException());
@@ -295,7 +303,7 @@ void writeFrame(TConnection *xConnection) {
         }
     }
 
-    xLen   = xPos + xConnection->mPayload;
+    xLen = xPos + xConnection->mPayload;
     xState = apr_socket_send(xConnection->mServer, xBuffer, &xLen);
     if (xState != APR_SUCCESS) {
         throw(TWebSocketException());
@@ -330,13 +338,14 @@ void wsproxy(request_rec *r, TConnection *xConnection) {
         xConnection->mClient = NULL;
         throw(TWebSocketException());
     }
-
+    
     xPfd = { r->pool, APR_POLL_SOCKET, APR_POLLIN, 0, { NULL }, xConnection };
     xPfd.desc.s = xConnection->mClient;
     apr_pollset_add(xPollset, &xPfd);
 
     xConnection->mServerPfd = xPfd;
     xConnection->mClientPfd = xPfd;
+    writeHandshake(r, xConnection);
 
     for (;;) {
         xState = apr_pollset_poll(xPollset, (APR_USEC_PER_SEC * 30), &xNum, (const apr_pollfd_t**)&xRetPfd);
@@ -365,7 +374,7 @@ void wsproxy(request_rec *r, TConnection *xConnection) {
 
                 if (xOpcode == 0x1 || xOpcode == 0x2) {
                     readFrame(aConnection);
-                    xLen   = aConnection->mPayload;
+                    xLen = aConnection->mPayload;
                     xState = apr_socket_send(aConnection->mClient, aConnection->mBuffer, &xLen);
                     if (xState != APR_SUCCESS) {
                         throw(TWebSocketException());
@@ -374,7 +383,7 @@ void wsproxy(request_rec *r, TConnection *xConnection) {
             }
 
             if (xRetPfd[i].desc.s == aConnection->mClient) {
-                xLen   = sizeof(aConnection->mBuffer);
+                xLen = sizeof(aConnection->mBuffer);
                 xState = apr_socket_recv(aConnection->mClient, aConnection->mBuffer, &xLen);
 
                 if (xState != APR_SUCCESS) {
@@ -475,4 +484,3 @@ extern "C" static void register_hooks(apr_pool_t *pool) {
 int main(int argc, char* argv[]) {
     return 0;
 }
-
