@@ -449,6 +449,7 @@ extern "C" static int eezz_handler(request_rec *r) {
                     xbuf << xBuff << endl;
                 }
             }
+            xbuf << ends;
             ap_rputs(xbuf.str(), r);
             return OK;
         }
