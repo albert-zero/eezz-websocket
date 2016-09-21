@@ -186,9 +186,9 @@ void writeHandshake(request_rec *r, TConnection *aConnection) {
 // ------------------------------------------------------------
 // ------------------------------------------------------------
 typedef union {
-    char         mBuffer[8];
-    apr_int16_t  mShort;
-    apr_int64_t  mLong;
+    char          mBuffer[8];
+    apr_int16_t   mShort;
+    apr_int64_t   mLong;
 } TBytes;
 
 // ------------------------------------------------------------
@@ -264,30 +264,36 @@ bool readFrame(TConnection *xConnection) {
 
 // ------------------------------------------------------------
 // ------------------------------------------------------------
-void writeFrame(TConnection *xConnection) {
+void writeFrame(TConnection *xConnection, bool aMasked = false) {
     TBytes       xBytes;
-    char         xBuffer[4096];
+    char         xBuffer[1024];
     int          xPos = 0;
     int          xMasked = 0;
     apr_size_t   xLen = 4096 - 1;
     apr_status_t xState;
 
-    xBuffer[xPos++] = xConnection->mFinal | xConnection->mOpcode;
-    if (xConnection->mMasked) {
+    if (xConnection->mFinal) {
+        xBuffer[xPos++] = (1 << 7) | xConnection->mOpcode;
+    }
+    else {
+        xBuffer[xPos++] = xConnection->mOpcode;
+    }
+
+    if (aMasked) {
         xMasked = 1 << 7;
     }
 
     if (xConnection->mPayload >= 126) {
         if (xConnection->mPayload < 0xffff) {
             xBuffer[xPos++] = 0x7e | xMasked;
-            xBytes.mShort = htons(xConnection->mPayload);
+            xBytes.mShort = htons((unsigned short)xConnection->mPayload);
             for (int i = 0; i < 2; i++) {
                 xBuffer[xPos++] = xBytes.mBuffer[i];
             }
         }
         else {
             xBuffer[xPos++] = 0x7f | xMasked;
-            xBytes.mLong = htons(xConnection->mPayload);
+            xBytes.mLong = htonll(xConnection->mPayload);
             for (int i = 0; i < 8; i++) {
                 xBuffer[xPos++] = xBytes.mBuffer[i];
             }
@@ -297,14 +303,24 @@ void writeFrame(TConnection *xConnection) {
         xBuffer[xPos++] = xConnection->mPayload | xMasked;
     }
 
-    if (xConnection->mMasked) {
-        for (int i = 0; i < xConnection->mPayload; i++) {
-            xBuffer[i] ^= xConnection->mVector[i % 4];
+    if (aMasked) {
+        int i;
+        for (i = 0; i < 4; i++) {  
+            xBuffer[xPos++] = xConnection->mVector[i];
+        }
+
+        for (i = 0; i < xConnection->mPayload; i++) {
+            xConnection->mBuffer[i] ^= xConnection->mVector[i % 4];
         }
     }
 
-    xLen = xPos + xConnection->mPayload;
+    xLen   = xPos;
     xState = apr_socket_send(xConnection->mServer, xBuffer, &xLen);
+    if (xState != APR_SUCCESS) {
+        throw(TWebSocketException());
+    }
+    xLen   = xConnection->mPayload;
+    xState = apr_socket_send(xConnection->mServer, xConnection->mBuffer, &xLen);
     if (xState != APR_SUCCESS) {
         throw(TWebSocketException());
     }
