@@ -12,7 +12,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
 // GNU General Public License for more details.
 // You should have received a copy of the GNU General Public License
-// along with this program.If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
 // ------------------------------------------------------------
 // #define AP_HAVE_DESIGNATED_INITIALIZER
 
@@ -75,13 +75,14 @@ public:
 
 // ------------------------------------------------------------
 // ------------------------------------------------------------
-typedef struct {
-    vector<string> mPathList;
+typedef struct CEezzConfig {
     int            mWebsocket;
     string         mHostname;
-    string         mDocumentRoot;
-    apr_pool_t    *mPool;
-    request_rec   *mRequest;
+
+    CEezzConfig() {
+        mHostname  = "localhost";
+        mWebsocket = 8401;
+    }
 } TEezzConfig;
 
 typedef struct {
@@ -105,10 +106,16 @@ static TEezzConfig gConfig;
 
 // ------------------------------------------------------------
 // ------------------------------------------------------------
+const char *setWebsocket(cmd_parms *cmd, void *cfg, const char *arg) {
+    istrstream iss(arg);
+    iss >> gConfig.mWebsocket;
+    return NULL;
+}
+
+// ------------------------------------------------------------
+// ------------------------------------------------------------
 static const command_rec directives[] = {
-    //AP_INIT_TAKE1("PythonPath", reinterpret_cast<cmd_func>(setPythonPath), NULL, ACCESS_CONF, "set the python path"),
-    //AP_INIT_TAKE1("Websocket",  reinterpret_cast<cmd_func>(setWebsocket),  NULL, ACCESS_CONF, "set websocket port"),
-    //AP_INIT_TAKE1("WsHostname", reinterpret_cast<cmd_func>(setHostname),   NULL, ACCESS_CONF, "set websocket host"),
+    AP_INIT_TAKE1("Websocket",  reinterpret_cast<cmd_func>(setWebsocket),  NULL, ACCESS_CONF, "set websocket port"),
     { NULL }
 };
 
@@ -266,10 +273,10 @@ bool readFrame(TConnection *xConnection) {
 // ------------------------------------------------------------
 void writeFrame(TConnection *xConnection, bool aMasked = false) {
     TBytes       xBytes;
-    char         xBuffer[1024];
+    char         xBuffer[16];
     int          xPos = 0;
     int          xMasked = 0;
-    apr_size_t   xLen = 4096 - 1;
+    apr_size_t   xLen;
     apr_status_t xState;
 
     if (xConnection->mFinal) {
@@ -344,7 +351,7 @@ void wsproxy(request_rec *r, TConnection *xConnection) {
     xPfd.desc.s = xConnection->mServer;
     apr_pollset_add(xPollset, &xPfd);
 
-    xState = apr_sockaddr_info_get(&xAddress, "localhost", APR_INET, 8401, 0, r->pool);
+    xState = apr_sockaddr_info_get(&xAddress, "localhost", APR_INET, gConfig.mWebsocket, 0, r->pool);
     if (xState != APR_SUCCESS) {
         throw(TWebSocketException());
     }
